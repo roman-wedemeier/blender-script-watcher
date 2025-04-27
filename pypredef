@@ -1,0 +1,13 @@
+import sys
+
+# Blender Python-Bibliothek
+sys.path.append('/Applications/Blender.app/Contents/Resources/4.4/python/lib/python3.11')
+
+# Dynamische Bibliotheken
+sys.path.append('/Applications/Blender.app/Contents/Resources/4.4/python/lib/python3.11/lib-dynload')
+
+# Standard-Bibliotheken
+sys.path.append('/Applications/Blender.app/Contents/Resources/4.4/python/lib/python3.11/site-packages')
+
+# Pfad zu Blender's modulen (wo bpy zu finden ist)
+sys.path.append('/Applications/Blender.app/Contents/Resources/4.4/scripts/modules')

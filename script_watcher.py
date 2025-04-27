@@ -21,365 +21,198 @@ Author: Isaac Weaver <wisaac407@gmail.com>
 
 bl_info = {
     "name": "Script Watcher",
-    "author": "Isaac Weaver",
-    "version": (0, 7),
-    "blender": (2, 80, 0),
+    "author": "Roman Wedemeier",
+    "version": (0, 8, 0),
+    "blender": (4, 4, 1),
     "location": "Properties > Scene > Script Watcher",
     "description": "Reloads an external script on edits.",
     "warning": "Still in beta stage.",
-    "wiki_url": "http://wiki.blender.org/index.php/Extensions:2.6/Py/Scripts/Development/Script_Watcher",
-    "tracker_url": "https://github.com/wisaac407/blender-script-watcher/issues/new",
     "category": "Development",
 }
 
-import os
-import sys
+import importlib.util
 import io
-import traceback
-import types
+import os
 import subprocess
+import sys
+import traceback
 
-import console_python  # Blender module giving us access to the blender python console.
 import bpy
-from bpy.app.handlers import persistent
 
 
-@persistent
-def load_handler(dummy):
-    running = bpy.context.scene.sw_settings.running
+# Blender 4.4.1 compatible operator base class
+class SW_OT_BaseOperator:
+    @classmethod
+    def poll(cls, context):
+        return context.scene is not None
 
-    # First of all, make sure script watcher is off on all the scenes.
-    for scene in bpy.data.scenes:
-        bpy.ops.wm.sw_watch_end({'scene': scene})
-
-    # Startup script watcher on the current scene if needed.
-    if running and bpy.context.scene.sw_settings.auto_watch_on_startup:
-        bpy.ops.wm.sw_watch_start()
-
-    # Reset the consoles list to remove all the consoles that don't exist anymore.
-    for screen in bpy.data.screens:
-        screen.sw_consoles.clear()
-
-
-def add_scrollback(ctx, text, text_type):
-    for line in text:
-        bpy.ops.console.scrollback_append(ctx, text=line.replace('\t', '    '),
-                                          type=text_type)
-
-
-def get_console_id(area):
-    """Return the console id of the given region."""
-    if area.type == 'CONSOLE':  # Only continue if we have a console area.
-        for region in area.regions:
-            if region.type == 'WINDOW':
-                return hash(region)  # The id is the hash of the window region.
-    return False
-
-
-def isnum(s):
-    return s[1:].isnumeric() and s[0] in '-+1234567890'
-
-
-def make_annotations(cls):
-    """Converts class fields to annotations if running with Blender 2.8"""
-    if bpy.app.version < (2, 80):
-        return cls
-    bl_props = {k: v for k, v in cls.__dict__.items() if isinstance(v, tuple)}
-    if bl_props:
-        if '__annotations__' not in cls.__dict__:
-            setattr(cls, '__annotations__', {})
-        annotations = cls.__dict__['__annotations__']
-        for k, v in bl_props.items():
-            annotations[k] = v
-            delattr(cls, k)
-    return cls
-
-
-class SplitIO(io.StringIO):
-    """Feed the input stream into another stream."""
-    PREFIX = '[Script Watcher]: '
-
-    _can_prefix = True
-
-    def __init__(self, stream):
-        io.StringIO.__init__(self)
-
-        self.stream = stream
-
-    def write(self, s):
-        # Make sure we prefix our string before we do anything else with it.
-        if self._can_prefix:
-            s = self.PREFIX + s
-        # only add the prefix if the last stream ended with a newline.
-        self._can_prefix = s.endswith('\n')
-
-        # Make sure to call the super classes write method.
-        io.StringIO.write(self, s)
-
-        # When we are written to, we also write to the secondary stream.
-        self.stream.write(s)
-
-
+# Script Watcher Loader
 class ScriptWatcherLoader:
-    """Load the script"""
-    filepath = None
-    mod_name = None
-    run_main = None
-
     def __init__(self, filepath, run_main=False):
-        self.filepath = filepath
-        self.mod_name = self.get_mod_name()
+        self.filepath = os.path.abspath(filepath)
         self.run_main = run_main
+        self.module = None
+        self._last_mtime = 0
+        self._mod_name = self._get_mod_name()
+
+    def _get_mod_name(self):
+        dirname, filename = os.path.split(self.filepath)
+        if filename == '__init__.py':
+            return os.path.basename(dirname)
+        return os.path.splitext(filename)[0]
 
     def load_module(self):
-        """Load the module"""
         try:
-            f = open(self.filepath)
-            paths, files = self.get_paths()
+            # Remove old module if exists
+            if self._mod_name in sys.modules:
+                del sys.modules[self._mod_name]
 
-            # Create the module and setup the basic properties.
-            mod = types.ModuleType(self.mod_name if self.run_main else '__main__')
-            mod.__file__ = self.filepath
-            mod.__path__ = paths
-            mod.__package__ = self.mod_name
-            mod.__loader__ = self
+            # Create new module
+            spec = importlib.util.spec_from_file_location(
+                self._mod_name if self.run_main else '__main__',
+                self.filepath
+            )
+            if spec is None:
+                raise ImportError(f"Could not create spec for {self.filepath}")
 
-            # Add the module to the system module cache.
-            sys.modules[self.mod_name] = mod
+            self.module = importlib.util.module_from_spec(spec)
+            sys.modules[self._mod_name] = self.module
 
-            # Finally, execute the module.
-            exec(compile(f.read(), self.filepath, 'exec'), mod.__dict__)
+            # Read and execute
+            with open(self.filepath, 'r', encoding='utf-8') as f:
+                code = compile(f.read(), self.filepath, 'exec')
+                exec(code, self.module.__dict__)
 
-            if self.run_main and 'main' in mod.__dict__:
-                mod.main()
+            # Call main if requested
+            if self.run_main and hasattr(self.module, 'main'):
+                self.module.main()
 
-        except IOError:
-            print('Could not open script file.')
-        except:
-            sys.stderr.write("There was an error when loading the module:\n" + traceback.format_exc())
-        else:
-            f.close()
+            self._last_mtime = os.path.getmtime(self.filepath)
+            return True
 
-    def reload(self):
-        """Reload the module clearing any cached sub-modules"""
-        print('Reloading script:', self.filepath)
-        self.remove_cached_mods()
-        self.load_module()
+        except Exception as e:
+            print(f"Error loading {self.filepath}:")
+            traceback.print_exc()
+            return False
 
-    def get_paths(self):
-        """Find all the python paths surrounding the given filepath."""
-        dirname = os.path.dirname(self.filepath)
+    def check_reload(self):
+        try:
+            current_mtime = os.path.getmtime(self.filepath)
+            if current_mtime > self._last_mtime:
+                return self.load_module()
+        except OSError:
+            pass
+        return False
 
-        paths = []
-        filepaths = []
+# Output capture
+class OutputCapture:
+    def __init__(self):
+        self._stdout = sys.stdout
+        self._stderr = sys.stderr
+        self._output = io.StringIO()
+        self._error = io.StringIO()
 
-        for root, dirs, files in os.walk(dirname, topdown=True):
-            if '__init__.py' in files:
-                paths.append(root)
-                for f in files:
-                    filepaths.append(os.path.join(root, f))
-            else:
-                dirs[:] = []  # No __init__ so we stop walking this dir.
+    def __enter__(self):
+        sys.stdout = self._output
+        sys.stderr = self._error
+        return self
 
-        # If we just have one (non __init__) file then return just that file.
-        return paths, filepaths or [self.filepath]
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        sys.stdout = self._stdout
+        sys.stderr = self._stderr
 
-    def get_mod_name(self):
-        """Return the module name."""
-        dir, mod = os.path.split(self.filepath)
+    def get_output(self):
+        return self._output.getvalue(), self._error.getvalue()
 
-        # Module is a package.
-        if mod == '__init__.py':
-            mod = os.path.basename(dir)
-
-        # Module is a single file.
-        else:
-            mod = os.path.splitext(mod)[0]
-
-        return mod
-
-    def remove_cached_mods(self):
-        """Remove all the script modules from the system cache."""
-        paths = self.get_paths()
-        for mod_name, mod in list(sys.modules.items()):
-            if hasattr(mod, '__file__') and mod.__file__ and os.path.dirname(mod.__file__) in paths:
-                del sys.modules[mod_name]
-
-# Addon preferences.
-@make_annotations
-class ScriptWatcherPreferences(bpy.types.AddonPreferences):
-    bl_idname = __name__
-
-    editor_path = bpy.props.StringProperty(
-        name='Editor Path',
-        description='Path to external editor.',
-        subtype='FILE_PATH'
-    )
-
-    def draw(self, context):
-        layout = self.layout
-
-        layout.prop(self, 'editor_path')
-
-
-# Define the script watching operator.
-class WatchScriptOperator(bpy.types.Operator):
-    """Watches the script for changes, reloads the script if any changes occur."""
+# Operators
+class SW_OT_WatchStart(bpy.types.Operator, SW_OT_BaseOperator):
     bl_idname = "wm.sw_watch_start"
     bl_label = "Watch Script"
 
     _timer = None
-    _running = False
-    _times = None
-    use_py_console = None
     loader = None
-
-    def reload_script(self, context):
-        """Reload this script while printing the output to blenders python console."""
-
-        # Setup stdout and stderr.
-        stdout = SplitIO(sys.stdout)
-        stderr = SplitIO(sys.stderr)
-
-        sys.stdout = stdout
-        sys.stderr = stderr
-
-        # Run the script.
-        self.loader.reload()
-
-        # Go back to the begining so we can read the streams.
-        stdout.seek(0)
-        stderr.seek(0)
-
-        # Don't use readlines because that leaves trailing new lines.
-        output = stdout.read().split('\n')
-        output_err = stderr.read().split('\n')
-
-        for console in context.screen.sw_consoles:
-            if console.active and isnum(console.name):  # Make sure it's not some random string.
-
-                console, _, _ = console_python.get_console(int(console.name))
-
-                # Set the locals to the modules dict.
-                console.locals = sys.modules[self.loader.mod_name].__dict__
-
-        if self.use_py_console:
-            # Print the output to the consoles.
-            for area in context.screen.areas:
-                if area.type == "CONSOLE":
-                    ctx = context.copy()
-                    ctx.update({"area": area})
-
-                    # Actually print the output.
-                    if output:
-                        add_scrollback(ctx, output, 'OUTPUT')
-
-                    if output_err:
-                        add_scrollback(ctx, output_err, 'ERROR')
-
-        # Cleanup
-        sys.stdout = sys.__stdout__
-        sys.stderr = sys.__stderr__
 
     def modal(self, context, event):
         if not context.scene.sw_settings.running:
             self.cancel(context)
             return {'CANCELLED'}
 
-        if context.scene.sw_settings.reload:
-            context.scene.sw_settings.reload = False
-            self.reload_script(context)
-            return {'PASS_THROUGH'}
-
         if event.type == 'TIMER':
-            for path in self._times:
-                cur_time = os.stat(path).st_mtime
-
-                if cur_time != self._times[path]:
-                    self._times[path] = cur_time
-                    self.reload_script(context)
+            if context.scene.sw_settings.reload:
+                context.scene.sw_settings.reload = False
+                with OutputCapture() as cap:
+                    self.loader.load_module()
+            else:
+                with OutputCapture() as cap:
+                    self.loader.check_reload()
 
         return {'PASS_THROUGH'}
 
     def execute(self, context):
-        if context.scene.sw_settings.running:
+        settings = context.scene.sw_settings
+        if settings.running:
             return {'CANCELLED'}
 
-        # Grab the settings and store them as local variables.
-        self.use_py_console = context.scene.sw_settings.use_py_console
-
-        filepath = bpy.path.abspath(context.scene.sw_settings.filepath)
-
-        # If it's not a file, doesn't exist or permission is denied we don't proceed.
+        filepath = bpy.path.abspath(settings.filepath)
         if not os.path.isfile(filepath):
-            self.report({'ERROR'}, 'Unable to open script.')
+            self.report({'ERROR'}, "Script file not found")
             return {'CANCELLED'}
 
-        self.loader = ScriptWatcherLoader(filepath, context.scene.sw_settings.run_main)
+        self.loader = ScriptWatcherLoader(filepath, settings.run_main)
 
-        # Setup the times dict to keep track of when all the files where last edited.
-        dirs, files = self.loader.get_paths()
-        self._times = dict(
-            (path, os.stat(path).st_mtime) for path in files)  # Where we store the times of all the paths.
-        self._times[files[0]] = 0  # We set one of the times to 0 so the script will be loaded on startup.
+        with OutputCapture() as cap:
+            if not self.loader.load_module():
+                return {'CANCELLED'}
 
-        # Setup the event timer.
         wm = context.window_manager
-        self._timer = wm.event_timer_add(0.1, window=context.window)
+        self._timer = wm.event_timer_add(0.5, window=context.window)
         wm.modal_handler_add(self)
 
-        context.scene.sw_settings.running = True
+        settings.running = True
         return {'RUNNING_MODAL'}
 
     def cancel(self, context):
-        wm = context.window_manager
-        wm.event_timer_remove(self._timer)
+        if self._timer:
+            context.window_manager.event_timer_remove(self._timer)
+        if hasattr(context.scene, 'sw_settings'):
+            context.scene.sw_settings.running = False
 
-        # Should we call a separate close function on the loader?
-        self.loader.remove_cached_mods()
-
-        context.scene.sw_settings.running = False
-
-
-class CancelScriptWatcher(bpy.types.Operator):
-    """Stop watching the current script."""
+class SW_OT_WatchEnd(bpy.types.Operator, SW_OT_BaseOperator):
     bl_idname = "wm.sw_watch_end"
     bl_label = "Stop Watching"
 
     def execute(self, context):
-        # Setting the running flag to false will cause the modal to cancel itself.
         context.scene.sw_settings.running = False
         return {'FINISHED'}
 
-
-class ReloadScriptWatcher(bpy.types.Operator):
-    """Reload the current script."""
+class SW_OT_Reload(bpy.types.Operator, SW_OT_BaseOperator):
     bl_idname = "wm.sw_reload"
     bl_label = "Reload Script"
 
     def execute(self, context):
-        # Setting the reload flag to true will cause the modal to cancel itself.
         context.scene.sw_settings.reload = True
         return {'FINISHED'}
 
-
-class OpenExternalEditor(bpy.types.Operator):
-    """Edit script in an external text editor."""
+class SW_OT_EditExternally(bpy.types.Operator, SW_OT_BaseOperator):
     bl_idname = "wm.sw_edit_externally"
     bl_label = "Edit Externally"
 
     def execute(self, context):
-        addon_prefs = context.user_preferences.addons[__name__].preferences
-
         filepath = bpy.path.abspath(context.scene.sw_settings.filepath)
-
-        subprocess.Popen((addon_prefs.editor_path, filepath))
+        try:
+            if sys.platform == "darwin":
+                subprocess.run(["open", filepath])
+            elif sys.platform == "win32":
+                os.startfile(filepath)
+            else:
+                subprocess.run(["xdg-open", filepath])
+        except Exception as e:
+            self.report({'ERROR'}, f"Could not open editor: {e}")
+            return {'CANCELLED'}
         return {'FINISHED'}
 
-
-# Create the UI for the operator. NEEDS FINISHING!!
-class ScriptWatcherPanel(bpy.types.Panel):
-    """UI for the script watcher."""
+# UI Panel
+class SW_PT_Panel(bpy.types.Panel):
     bl_label = "Script Watcher"
     bl_idname = "SCENE_PT_script_watcher"
     bl_space_type = 'PROPERTIES'
@@ -388,157 +221,81 @@ class ScriptWatcherPanel(bpy.types.Panel):
 
     def draw(self, context):
         layout = self.layout
-        running = context.scene.sw_settings.running
+        settings = context.scene.sw_settings
 
         col = layout.column()
-        col.prop(context.scene.sw_settings, 'filepath')
-        col.prop(context.scene.sw_settings, 'use_py_console')
-        col.prop(context.scene.sw_settings, 'auto_watch_on_startup')
-        col.prop(context.scene.sw_settings, 'run_main')
+        col.prop(settings, 'filepath')
+        col.prop(settings, 'use_py_console')
+        col.prop(settings, 'auto_watch_on_startup')
+        col.prop(settings, 'run_main')
 
-        if bpy.app.version < (2, 80, 0):
-            col.operator('wm.sw_watch_start', icon='VISIBLE_IPO_ON')
+        if not settings.running:
+            col.operator(SW_OT_WatchStart.bl_idname, icon='PLAY')
         else:
-            col.operator('wm.sw_watch_start', icon='HIDE_OFF')
-
-        col.enabled = not running
-
-        if running:
             row = layout.row(align=True)
-            row.operator('wm.sw_watch_end', icon='CANCEL')
-            row.operator('wm.sw_reload', icon='FILE_REFRESH')
+            row.operator(SW_OT_WatchEnd.bl_idname, icon='CANCEL')
+            row.operator(SW_OT_Reload.bl_idname, icon='FILE_REFRESH')
 
         layout.separator()
-        layout.operator('wm.sw_edit_externally', icon='TEXT')
+        layout.operator(SW_OT_EditExternally.bl_idname, icon='TEXT')
 
+# Property Group
+class SW_Settings(bpy.types.PropertyGroup):
+    running: bpy.props.BoolProperty(
+        name="Running",
+        default=False
+    )
 
-@make_annotations
-class ScriptWatcherSettings(bpy.types.PropertyGroup):
-    """All the script watcher settings."""
-    running = bpy.props.BoolProperty(default=False)
-    reload = bpy.props.BoolProperty(default=False)
+    reload: bpy.props.BoolProperty(
+        name="Reload",
+        default=False
+    )
 
-    filepath = bpy.props.StringProperty(
-        name='Script',
-        description='Script file to watch for changes.',
+    filepath: bpy.props.StringProperty(
+        name="Script",
+        description="Script file to watch",
         subtype='FILE_PATH'
     )
 
-    use_py_console = bpy.props.BoolProperty(
-        name='Use py console',
-        description='Use blenders built-in python console for program output (e.g. print statements and error messages)',
+    use_py_console: bpy.props.BoolProperty(
+        name="Use Python Console",
+        description="Show output in Blender's Python console",
+        default=True
+    )
+
+    auto_watch_on_startup: bpy.props.BoolProperty(
+        name="Auto Start",
+        description="Automatically start watching when loading this blend file",
         default=False
     )
 
-    auto_watch_on_startup = bpy.props.BoolProperty(
-        name='Watch on startup',
-        description='Watch script automatically on new .blend load',
+    run_main: bpy.props.BoolProperty(
+        name="Run main()",
+        description="Call main() function instead of executing as __main__",
         default=False
     )
 
-    run_main = bpy.props.BoolProperty(
-        name='Run Main',
-        description='Instead of running the module with the name __main__ execute the module and call main()',
-        default=False,
-    )
-
-
-def update_debug(self, context):
-    console_id = get_console_id(context.area)
-
-    console, _, _ = console_python.get_console(console_id)
-
-    if self.active:
-        console.globals = console.locals
-
-        if context.scene.sw_settings.running:
-            dir, mod = os.path.split(bpy.path.abspath(context.scene.sw_settings.filepath))
-
-            # XXX This is almost the same as get_mod_name so it should become a global function.
-            if mod == '__init__.py':
-                mod = os.path.basename(dir)
-            else:
-                mod = os.path.splitext(mod)[0]
-
-            console.locals = sys.modules[mod].__dict__
-
-    else:
-        console.locals = console.globals
-
-        # ctx = context.copy() # Operators only take dicts.
-        # bpy.ops.console.update_console(ctx, debug_mode=self.active, script='test-script.py')
-
-
-@make_annotations
-class SWConsoleSettings(bpy.types.PropertyGroup):
-    active = bpy.props.BoolProperty(
-        name="Debug Mode",
-        update=update_debug,
-        description="Enter Script Watcher debugging mode (when in debug mode you can access the script variables).",
-        default=False
-    )
-
-
-class SWConsoleHeader(bpy.types.Header):
-    bl_idname = "CONSOLE_HT_script_watcher"
-    bl_space_type = 'CONSOLE'
-
-    def draw(self, context):
-        layout = self.layout
-
-        cs = context.screen.sw_consoles
-
-        console_id = str(get_console_id(context.area))
-
-        # Make sure this console is in the consoles collection.
-        if console_id not in cs:
-            console = cs.add()
-            console.name = console_id
-
-        row = layout.row()
-        row.scale_x = 1.8
-        row.prop(cs[console_id], 'active', toggle=True)
-
+# Registration
 classes = (
-    ScriptWatcherPreferences,
-
-    WatchScriptOperator,
-    CancelScriptWatcher,
-    ReloadScriptWatcher,
-    OpenExternalEditor,
-
-    ScriptWatcherPanel,
-    ScriptWatcherSettings,
-    SWConsoleSettings,
-    SWConsoleHeader,
+    SW_Settings,
+    SW_OT_WatchStart,
+    SW_OT_WatchEnd,
+    SW_OT_Reload,
+    SW_OT_EditExternally,
+    SW_PT_Panel,
 )
 
 def register():
-    from bpy.utils import register_class
     for cls in classes:
-        register_class(cls)
+        bpy.utils.register_class(cls)
 
-    bpy.types.Scene.sw_settings = \
-        bpy.props.PointerProperty(type=ScriptWatcherSettings)
-
-    bpy.app.handlers.load_post.append(load_handler)
-
-    bpy.types.Screen.sw_consoles = bpy.props.CollectionProperty(
-        type=SWConsoleSettings
-    )
-
+    bpy.types.Scene.sw_settings = bpy.props.PointerProperty(type=SW_Settings)
 
 def unregister():
-    from bpy.utils import unregister_class
     for cls in reversed(classes):
-        unregister_class(cls)
-
-    bpy.app.handlers.load_post.remove(load_handler)
+        bpy.utils.unregister_class(cls)
 
     del bpy.types.Scene.sw_settings
-
-    del bpy.types.Screen.sw_consoles
-
 
 if __name__ == "__main__":
     register()
