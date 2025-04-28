@@ -22,7 +22,7 @@ Author: Isaac Weaver <wisaac407@gmail.com>
 bl_info = {
     "name": "Script Watcher",
     "author": "Roman Wedemeier",
-    "version": (0, 8, 0),
+    "version": (0, 8, 1),
     "blender": (4, 4, 1),
     "location": "Properties > Scene > Script Watcher",
     "description": "Reloads an external script on edits.",
@@ -41,6 +41,7 @@ import bpy
 
 
 # Blender 4.4.1 compatible operator base class
+# noinspection PyPep8Naming
 class SW_OT_BaseOperator:
     @classmethod
     def poll(cls, context):
@@ -52,13 +53,13 @@ class ScriptWatcherLoader:
         self.filepath = os.path.abspath(filepath)
         self.run_main = run_main
         self.module = None
-        self._last_mtime = 0
+        self._last_modification_time = 0
         self._mod_name = self._get_mod_name()
 
     def _get_mod_name(self):
-        dirname, filename = os.path.split(self.filepath)
+        dir_name, filename = os.path.split(self.filepath)
         if filename == '__init__.py':
-            return os.path.basename(dirname)
+            return os.path.basename(dir_name)
         return os.path.splitext(filename)[0]
 
     def load_module(self):
@@ -87,18 +88,22 @@ class ScriptWatcherLoader:
             if self.run_main and hasattr(self.module, 'main'):
                 self.module.main()
 
-            self._last_mtime = os.path.getmtime(self.filepath)
+            self._last_modification_time = os.path.getmtime(self.filepath)
             return True
 
-        except Exception as e:
-            print(f"Error loading {self.filepath}:")
+        except (IOError, OSError) as e:
+            print(f"Script konnte nicht gelesen werden: {e}")
+            return False
+
+        except (ImportError, AttributeError, SyntaxError) as e:
+            print(f"Script enthält Fehler: {e}")
             traceback.print_exc()
             return False
 
     def check_reload(self):
         try:
-            current_mtime = os.path.getmtime(self.filepath)
-            if current_mtime > self._last_mtime:
+            current_modification_time = os.path.getmtime(self.filepath)
+            if current_modification_time > self._last_modification_time:
                 return self.load_module()
         except OSError:
             pass
@@ -125,8 +130,9 @@ class OutputCapture:
         return self._output.getvalue(), self._error.getvalue()
 
 # Operators
+# noinspection PyPep8Naming
 class SW_OT_WatchStart(bpy.types.Operator, SW_OT_BaseOperator):
-    bl_idname = "wm.sw_watch_start"
+    bl_id_name = "wm.sw_watch_start"
     bl_label = "Watch Script"
 
     _timer = None
@@ -140,10 +146,10 @@ class SW_OT_WatchStart(bpy.types.Operator, SW_OT_BaseOperator):
         if event.type == 'TIMER':
             if context.scene.sw_settings.reload:
                 context.scene.sw_settings.reload = False
-                with OutputCapture() as cap:
+                with OutputCapture() as _:
                     self.loader.load_module()
             else:
-                with OutputCapture() as cap:
+                with OutputCapture() as _:
                     self.loader.check_reload()
 
         return {'PASS_THROUGH'}
@@ -160,7 +166,7 @@ class SW_OT_WatchStart(bpy.types.Operator, SW_OT_BaseOperator):
 
         self.loader = ScriptWatcherLoader(filepath, settings.run_main)
 
-        with OutputCapture() as cap:
+        with OutputCapture() as _:
             if not self.loader.load_module():
                 return {'CANCELLED'}
 
@@ -177,24 +183,29 @@ class SW_OT_WatchStart(bpy.types.Operator, SW_OT_BaseOperator):
         if hasattr(context.scene, 'sw_settings'):
             context.scene.sw_settings.running = False
 
+# noinspection PyPep8Naming
 class SW_OT_WatchEnd(bpy.types.Operator, SW_OT_BaseOperator):
-    bl_idname = "wm.sw_watch_end"
+    bl_id_name = "wm.sw_watch_end"
     bl_label = "Stop Watching"
 
-    def execute(self, context):
+    @staticmethod
+    def execute(context):
         context.scene.sw_settings.running = False
         return {'FINISHED'}
 
+# noinspection PyPep8Naming
 class SW_OT_Reload(bpy.types.Operator, SW_OT_BaseOperator):
-    bl_idname = "wm.sw_reload"
+    bl_id_name = "wm.sw_reload"
     bl_label = "Reload Script"
 
-    def execute(self, context):
+    @staticmethod
+    def execute(context):
         context.scene.sw_settings.reload = True
         return {'FINISHED'}
 
+# noinspection PyPep8Naming
 class SW_OT_EditExternally(bpy.types.Operator, SW_OT_BaseOperator):
-    bl_idname = "wm.sw_edit_externally"
+    bl_id_name = "wm.sw_edit_externally"
     bl_label = "Edit Externally"
 
     def execute(self, context):
@@ -212,9 +223,10 @@ class SW_OT_EditExternally(bpy.types.Operator, SW_OT_BaseOperator):
         return {'FINISHED'}
 
 # UI Panel
+# noinspection PyPep8Naming
 class SW_PT_Panel(bpy.types.Panel):
     bl_label = "Script Watcher"
-    bl_idname = "SCENE_PT_script_watcher"
+    bl_id_name = "SCENE_PT_script_watcher"
     bl_space_type = 'PROPERTIES'
     bl_region_type = 'WINDOW'
     bl_context = "scene"
@@ -230,16 +242,17 @@ class SW_PT_Panel(bpy.types.Panel):
         col.prop(settings, 'run_main')
 
         if not settings.running:
-            col.operator(SW_OT_WatchStart.bl_idname, icon='PLAY')
+            col.operator(SW_OT_WatchStart.bl_id_name, icon='PLAY')
         else:
             row = layout.row(align=True)
-            row.operator(SW_OT_WatchEnd.bl_idname, icon='CANCEL')
-            row.operator(SW_OT_Reload.bl_idname, icon='FILE_REFRESH')
+            row.operator(SW_OT_WatchEnd.bl_id_name, icon='CANCEL')
+            row.operator(SW_OT_Reload.bl_id_name, icon='FILE_REFRESH')
 
         layout.separator()
-        layout.operator(SW_OT_EditExternally.bl_idname, icon='TEXT')
+        layout.operator(SW_OT_EditExternally.bl_id_name, icon='TEXT')
 
 # Property Group
+# noinspection PyPep8Naming
 class SW_Settings(bpy.types.PropertyGroup):
     running: bpy.props.BoolProperty(
         name="Running",
